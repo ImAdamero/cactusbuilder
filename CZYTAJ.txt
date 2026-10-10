@@ -1,0 +1,5 @@
+Wersja "plaska" - wszystkie pliki w jednym folderze (do wgrania z telefonu na GitHub).
+1) Wgraj wszystkie te pliki do repozytorium (Add file > Upload files).
+2) Utworz plik .github/workflows/build.yml (Add file > Create new file)
+   i wklej tresc z pliku build.yml.txt.
+3) Zakladka Actions > ostatni przebieg > Artifacts > cactusbuilder-jar.
