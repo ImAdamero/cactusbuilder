@@ -29,19 +29,23 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import org.lwjgl.glfw.GLFW;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /**
  * G = start / pauza (wznawia od pierwszego brakujacego miejsca w chunku, na ktorym stoisz)
  * H = zapomnij sesje (nowy poziom podloza przy nastepnym starcie)
  *
- * Gdy HP spadnie, praca sie PAUZUJE (nie konczy): mod schodzi z kaktusa, je refy,
- * czeka na leczenie i sam wznawia budowe. Jesli masz wlasny auto-eat w kliencie,
- * ustaw BUILTIN_EAT = false - mod i tak pauzuje, dopoki trwa jedzenie / HP jest niskie.
+ * v3: szachownica juz od podloza, kucanie przy stawianiu piasku na doniczce,
+ * doniczka + piasek komorka po komorce oraz szukanie bezpiecznej drogi (omija kaktusy).
  */
 public class CactusBuilderClient implements ClientModInitializer {
 
@@ -49,12 +53,13 @@ public class CactusBuilderClient implements ClientModInitializer {
     private static final int MAX_LAYERS = 8;        // ile pieter (po 2 wysokosci) planowac
     private static final int PLACE_DELAY = 2;       // ticki miedzy blokami (+ losowo 0-1)
     private static final double REACH = 4.3;        // zasieg stawiania
-    private static final double APPROACH = 3.4;     // jak blisko podejsc, gdy cel jest za daleko
+    private static final double STAND_REACH = 4.0;  // z jak daleko szuka miejsca do stania
     private static final int RESTOCK_SLOT = 8;      // slot paska, do ktorego dobiera przedmioty
     private static final int MAX_ATTEMPTS = 6;      // tyle prob na jedno miejsce, potem pomija
-    private static final int MAX_WALK_TICKS = 300;  // tyle tickow na dojscie do celu
+    private static final int MAX_WALK_TICKS = 400;  // tyle tickow na dojscie do celu
     private static final int PER_LAYER = 128;       // 256 pol / 2 (szachownica)
     private static final float MAX_TURN = 25f;      // max obrot glowy na tick (stopnie)
+    private static final int BFS_NODES = 2500;      // limit przeszukiwania drogi
 
     // leczenie
     private static final float MIN_HEALTH = 6.0f;   // ponizej tego: pauza i leczenie
@@ -67,6 +72,10 @@ public class CactusBuilderClient implements ClientModInitializer {
 
     private enum State { IDLE, RUNNING }
     private enum Res { DONE, WAIT, NO_SUPPORT, NO_ITEM }
+
+    private static final int[][] DIRS = {
+            {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+    };
 
     private static final Random RNG = new Random();
 
@@ -86,13 +95,19 @@ public class CactusBuilderClient implements ClientModInitializer {
     private static int rounds, cooldown, walkTicks, hudTimer, ticks;
     private static boolean walking;
 
+    // sciezka
+    private static final List<BlockPos> path = new ArrayList<>();
+    private static int pathIdx, pathAge;
+    private static BlockPos pathFor;
+    private static boolean pathFailed;
+
     // leczenie
     private static boolean healing, eatStarted;
     private static float lastHp;
     private static int lastHealTick;
 
     private static int[] remaining = new int[3]; // kaktus, piasek, doniczka
-    private static int baseMissing = 256;
+    private static int baseMissing = 128;
 
     @Override
     public void onInitializeClient() {
@@ -152,6 +167,7 @@ public class CactusBuilderClient implements ClientModInitializer {
         if (target == null) {
             target = plan.next(w, skipped);
             walkTicks = 0;
+            pathFor = null;
             if (target == null) {
                 if (!skipped.isEmpty() && rounds < 2) {
                     rounds++;
@@ -168,22 +184,43 @@ public class CactusBuilderClient implements ClientModInitializer {
         BlockPos pos = target.pos();
         Vec3d center = Vec3d.ofCenter(pos);
         double dist = p.getEyePos().distanceTo(center);
+        boolean intersects = p.getBoundingBox().intersects(new Box(pos));
+        boolean inReach = !intersects && dist <= REACH;
+        boolean safeHere = !unsafe(w, p.getBlockPos());
 
-        // stoisz w miejscu, gdzie ma byc blok - odejdz
-        if (p.getBoundingBox().intersects(new Box(pos))) {
-            Vec3d away = new Vec3d(p.getX() - center.x, 0, p.getZ() - center.z);
-            if (away.lengthSquared() < 1.0E-4) away = new Vec3d(1, 0, 0);
-            walkTo(mc, new Vec3d(p.getX(), p.getY(), p.getZ()).add(away.normalize().multiply(2.0)));
-            return;
+        // czy stawiamy stad, czy najpierw idziemy w lepsze miejsce
+        if (!(inReach && safeHere)) {
+            int limit = pathFailed ? 40 : 10;
+            if (!pos.equals(pathFor) || ++pathAge > limit) planPath(mc, target);
+
+            if (!pathFailed && followPath(mc)) {
+                if (++walkTicks > MAX_WALK_TICKS) skip(pos);
+                return;
+            }
+            if (pathFailed && !inReach) {                       // brak drogi - stara metoda
+                if (++walkTicks > MAX_WALK_TICKS) { skip(pos); return; }
+                if (intersects) {
+                    Vec3d away = new Vec3d(p.getX() - center.x, 0, p.getZ() - center.z);
+                    if (away.lengthSquared() < 1.0E-4) away = new Vec3d(1, 0, 0);
+                    walkTo(mc, new Vec3d(p.getX(), p.getY(), p.getZ()).add(away.normalize().multiply(2.0)), false);
+                } else {
+                    walkTo(mc, center, false);
+                }
+                return;
+            }
+            if (!inReach) {                                     // sciezka skonczona, ale cel dalej poza zasiegiem
+                pathFor = null;
+                stopWalking(mc);
+                return;
+            }
         }
 
-        // za daleko - podejdz (z histereza)
-        if (dist > REACH || (walking && dist > APPROACH)) {
-            if (++walkTicks > MAX_WALK_TICKS) { skip(pos); return; }
-            walkTo(mc, center);
-            return;
-        }
+        // ---- stawianie ----
         stopWalking(mc);
+        boolean sneak = target.kind() == ChunkPlan.Kind.SAND
+                && w.getBlockState(pos.down()).isOf(Blocks.FLOWER_POT);
+        mc.options.sneakKey.setPressed(sneak);          // na pustej doniczce trzeba kucac
+        if (sneak && !p.isSneaking()) return;           // czekamy az postac kucnie
 
         if (cooldown-- > 0) return;
         cooldown = PLACE_DELAY + RNG.nextInt(2);
@@ -203,6 +240,7 @@ public class CactusBuilderClient implements ClientModInitializer {
         skipped.add(pos);
         attempts.remove(pos);
         target = null;
+        pathFor = null;
     }
 
     private static void start(MinecraftClient mc) {
@@ -220,6 +258,8 @@ public class CactusBuilderClient implements ClientModInitializer {
         skipped.clear();
         attempts.clear();
         target = null;
+        pathFor = null;
+        path.clear();
         rounds = 0;
         cooldown = 0;
         hudTimer = 20;
@@ -236,6 +276,7 @@ public class CactusBuilderClient implements ClientModInitializer {
         state = State.IDLE;
         status = why;
         target = null;
+        pathFor = null;
         healing = false;
         eatStarted = false;
         stopWalking(mc);
@@ -312,6 +353,33 @@ public class CactusBuilderClient implements ClientModInitializer {
         mc.options.useKey.setPressed(true);
     }
 
+    /** Podczas leczenia zejdz od kaktusa na najblizsze bezpieczne pole. */
+    private static void moveToSafeSpot(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w) {
+        BlockPos here = p.getBlockPos();
+        if (!unsafe(w, here)) return;
+        if (path.isEmpty() || ticks % 10 == 0) {
+            List<BlockPos> r = findPath(w, here, g -> !g.equals(here), true);
+            path.clear();
+            pathIdx = 0;
+            pathFor = null;
+            if (r != null) {
+                path.addAll(r);
+                if (!path.isEmpty() && path.get(0).equals(here)) pathIdx = 1;
+            }
+        }
+        followPath(mc);
+    }
+
+    // ------------------------------------------------- swiat i bezpieczenstwo
+
+    private static boolean solid(ClientWorld w, BlockPos pos) {
+        return !w.getBlockState(pos).getCollisionShape(w, pos).isEmpty();
+    }
+
+    private static boolean passable(ClientWorld w, BlockPos pos) {
+        return !solid(w, pos) && w.getFluidState(pos).isEmpty();
+    }
+
     private static boolean cactusAt(ClientWorld w, BlockPos pos) {
         return w.getBlockState(pos).isOf(Blocks.CACTUS);
     }
@@ -325,27 +393,119 @@ public class CactusBuilderClient implements ClientModInitializer {
         return false;
     }
 
-    /** Podczas leczenia zejdz z/od kaktusa, zeby nie tracic HP. */
-    private static void moveToSafeSpot(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w) {
-        BlockPos here = p.getBlockPos();
-        if (!unsafe(w, here)) return;
-        for (Direction d : Direction.Type.HORIZONTAL) {
-            BlockPos c = here.offset(d);
-            if (!solid(w, c) && !solid(w, c.up()) && solid(w, c.down())
-                    && !cactusAt(w, c.down()) && !unsafe(w, c)) {
-                walkTo(mc, Vec3d.ofBottomCenter(c));
-                return;
+    /** Czy mozna tu stanac (stopy w komorce f). strict = dodatkowo bez kaktusa obok. */
+    private static boolean validStand(ClientWorld w, BlockPos f, boolean strict) {
+        if (!passable(w, f) || !passable(w, f.up())) return false;
+        BlockPos below = f.down();
+        if (!solid(w, below) || cactusAt(w, below)) return false;
+        if (!w.getFluidState(below).isEmpty()) return false;
+        if (cactusAt(w, f) || cactusAt(w, f.up())) return false;
+        return !(strict && unsafe(w, f));
+    }
+
+    // ----------------------------------------------------- szukanie drogi
+
+    /** BFS po polach, na ktorych mozna stanac. Zwraca liste od startu do celu albo null. */
+    private static List<BlockPos> findPath(ClientWorld w, BlockPos start,
+                                           Predicate<BlockPos> goal, boolean strict) {
+        Map<BlockPos, BlockPos> prev = new HashMap<>();
+        ArrayDeque<BlockPos> queue = new ArrayDeque<>();
+        prev.put(start, null);
+        queue.add(start);
+
+        while (!queue.isEmpty() && prev.size() < BFS_NODES) {
+            BlockPos f = queue.poll();
+            boolean standable = !f.equals(start) || validStand(w, f, strict);
+            if (standable && goal.test(f)) {
+                List<BlockPos> res = new ArrayList<>();
+                for (BlockPos c = f; c != null; c = prev.get(c)) res.add(c);
+                Collections.reverse(res);
+                return res;
+            }
+
+            for (int[] d : DIRS) {
+                boolean diag = d[0] != 0 && d[1] != 0;
+                for (int dy = 1; dy >= -3; dy--) {
+                    BlockPos g = new BlockPos(f.getX() + d[0], f.getY() + dy, f.getZ() + d[1]);
+                    if (prev.containsKey(g)) continue;
+                    if (!plan.contains(g.getX() + 0.5, g.getZ() + 0.5, 2.0)) continue;
+                    if (!validStand(w, g, strict)) continue;
+                    if (dy == 1 && solid(w, f.up(2))) continue;      // brak miejsca na skok
+
+                    boolean ok = true;
+                    if (diag) {                                       // nie przecisniesz sie miedzy dwoma blokami
+                        int maxY = f.getY() + 1 + (dy == 1 ? 1 : 0);
+                        for (int y = f.getY(); y <= maxY && ok; y++) {
+                            if (solid(w, new BlockPos(f.getX() + d[0], y, f.getZ()))
+                                    || solid(w, new BlockPos(f.getX(), y, f.getZ() + d[1]))) {
+                                ok = false;
+                            }
+                        }
+                    }
+                    for (int y = g.getY() + 2; y <= f.getY() + 1 && ok; y++) {   // zeskok: kolumna wolna
+                        if (solid(w, new BlockPos(g.getX(), y, g.getZ()))) ok = false;
+                    }
+                    if (!ok) continue;
+
+                    prev.put(g, f);
+                    queue.add(g);
+                    break;                                            // jedno pole na kolumne
+                }
             }
         }
+        return null;
+    }
+
+    private static boolean standOk(BlockPos g, BlockPos targetPos, Vec3d center) {
+        if (g.equals(targetPos) || g.up().equals(targetPos)) return false;
+        Vec3d eye = new Vec3d(g.getX() + 0.5, g.getY() + 1.62, g.getZ() + 0.5);
+        return eye.distanceTo(center) <= STAND_REACH;
+    }
+
+    private static void planPath(MinecraftClient mc, ChunkPlan.Target t) {
+        ClientWorld w = mc.world;
+        BlockPos start = mc.player.getBlockPos();
+        BlockPos pos = t.pos();
+        Vec3d center = Vec3d.ofCenter(pos);
+        Predicate<BlockPos> goal = g -> standOk(g, pos, center);
+
+        List<BlockPos> r = findPath(w, start, goal, true);      // najpierw tylko bezpiecznie
+        if (r == null) r = findPath(w, start, goal, false);     // potem dopuszczamy kaktusy obok
+
+        path.clear();
+        pathIdx = 0;
+        pathAge = 0;
+        pathFor = pos;
+        if (r == null) {
+            pathFailed = true;
+        } else {
+            pathFailed = false;
+            path.addAll(r);
+            if (!path.isEmpty() && path.get(0).equals(start)) pathIdx = 1;
+        }
+    }
+
+    /** Idzie po sciezce. true = jeszcze idzie. */
+    private static boolean followPath(MinecraftClient mc) {
+        ClientPlayerEntity p = mc.player;
+        while (pathIdx < path.size()) {
+            BlockPos wp = path.get(pathIdx);
+            double dx = wp.getX() + 0.5 - p.getX();
+            double dz = wp.getZ() + 0.5 - p.getZ();
+            boolean closeXZ = Math.sqrt(dx * dx + dz * dz) < 0.3;
+            if (closeXZ && Math.abs(wp.getY() - p.getY()) < 1.2) {
+                pathIdx++;
+                continue;
+            }
+            walkTo(mc, Vec3d.ofBottomCenter(wp), wp.getY() > p.getBlockPos().getY());
+            return true;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------- ruch
 
-    private static boolean solid(ClientWorld w, BlockPos pos) {
-        return !w.getBlockState(pos).getCollisionShape(w, pos).isEmpty();
-    }
-
-    private static void walkTo(MinecraftClient mc, Vec3d goal) {
+    private static void walkTo(MinecraftClient mc, Vec3d goal, boolean jumpUp) {
         ClientPlayerEntity p = mc.player;
         ClientWorld w = mc.world;
         double dx = goal.x - p.getX();
@@ -360,17 +520,18 @@ public class CactusBuilderClient implements ClientModInitializer {
         }
         boolean aligned = Math.abs(diff) < 50f;
 
+        mc.options.sneakKey.setPressed(false);
         mc.options.forwardKey.setPressed(len > 0.15 && aligned);
         walking = true;
 
-        // auto-skok na przeszkode wysokosci 1 (np. kaktus, potem piasek)
+        // skok na przeszkode wysokosci 1 albo na wyzsze pole sciezki
         boolean jump = false;
         if (len > 0.01 && aligned && p.isOnGround()) {
             double nx = dx / len, nz = dz / len;
             BlockPos ahead = BlockPos.ofFloored(p.getX() + nx * 0.7, p.getY(), p.getZ() + nz * 0.7);
             boolean blocked = solid(w, ahead);
             boolean room = !solid(w, ahead.up()) && !solid(w, ahead.up(2));
-            jump = blocked && room;
+            jump = (blocked && room) || (jumpUp && len < 1.3);
         }
         mc.options.jumpKey.setPressed(jump);
     }
@@ -379,6 +540,7 @@ public class CactusBuilderClient implements ClientModInitializer {
         walking = false;
         mc.options.forwardKey.setPressed(false);
         mc.options.jumpKey.setPressed(false);
+        mc.options.sneakKey.setPressed(false);
     }
 
     // -------------------------------------------------------- stawianie
@@ -463,7 +625,7 @@ public class CactusBuilderClient implements ClientModInitializer {
         int cacti = count(p, Items.CACTUS);
         int refs = count(p, HEAL_ITEM);
 
-        int missingBase = plan != null ? baseMissing : 256;
+        int missingBase = plan != null ? baseMissing : 128;
         int layers = Math.min(Math.min(cacti / PER_LAYER, pots / PER_LAYER),
                 Math.max(0, sand - missingBase) / PER_LAYER);
 
